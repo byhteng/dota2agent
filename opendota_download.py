@@ -52,6 +52,24 @@ def make_output_dir(output_dir: str | None, prefix: str = "opendota_dump") -> Pa
     return out
 
 
+def cleanup_empty_dir(path: Path, stop_at: Path | None = None) -> None:
+    stop_at_resolved = stop_at.resolve() if stop_at else None
+    current = path.resolve()
+
+    while current.exists() and current.is_dir():
+        if stop_at_resolved and current == stop_at_resolved:
+            break
+        try:
+            next(current.iterdir())
+            break
+        except StopIteration:
+            current.rmdir()
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+
+
 def save_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -214,45 +232,49 @@ def fetch_match_details(
     details_dir.mkdir(parents=True, exist_ok=True)
     manifest: List[Dict[str, Any]] = []
 
-    for idx, m in enumerate(matches, start=1):
-        match_id = m.get("match_id")
-        if match_id is None:
-            print(f"[skip] missing match_id in item #{idx}", file=sys.stderr)
-            continue
+    try:
+        for idx, m in enumerate(matches, start=1):
+            match_id = m.get("match_id")
+            if match_id is None:
+                print(f"[skip] missing match_id in item #{idx}", file=sys.stderr)
+                continue
 
-        file_path = details_dir / f"{match_id}.json"
-        if skip_existing and file_path.exists():
-            try:
-                with file_path.open("r", encoding="utf-8") as f:
-                    existing = json.load(f)
-            except json.JSONDecodeError:
-                existing = {"match_id": match_id}
+            file_path = details_dir / f"{match_id}.json"
+            if skip_existing and file_path.exists():
+                try:
+                    with file_path.open("r", encoding="utf-8") as f:
+                        existing = json.load(f)
+                except json.JSONDecodeError:
+                    existing = {"match_id": match_id}
+                manifest.append(
+                    {
+                        "match_id": match_id,
+                        "file": file_path.name,
+                        "source_url": build_url(f"/matches/{match_id}"),
+                        "status": "skipped_existing",
+                        "quality": summarize_match_detail(existing),
+                    }
+                )
+                print(f"[{idx}/{len(matches)}] reused existing match {match_id} -> {file_path}")
+                continue
+
+            data, url = get_json(f"/matches/{match_id}", timeout=timeout, retries=retries)
+            save_json(file_path, data)
             manifest.append(
                 {
                     "match_id": match_id,
                     "file": file_path.name,
-                    "source_url": build_url(f"/matches/{match_id}"),
-                    "status": "skipped_existing",
-                    "quality": summarize_match_detail(existing),
+                    "source_url": url,
+                    "status": "downloaded",
+                    "quality": summarize_match_detail(data),
                 }
             )
-            print(f"[{idx}/{len(matches)}] reused existing match {match_id} -> {file_path}")
-            continue
-
-        data, url = get_json(f"/matches/{match_id}", timeout=timeout, retries=retries)
-        save_json(file_path, data)
-        manifest.append(
-            {
-                "match_id": match_id,
-                "file": file_path.name,
-                "source_url": url,
-                "status": "downloaded",
-                "quality": summarize_match_detail(data),
-            }
-        )
-        print(f"[{idx}/{len(matches)}] saved match {match_id} -> {file_path}")
-        if idx < len(matches):
-            time.sleep(delay)
+            print(f"[{idx}/{len(matches)}] saved match {match_id} -> {file_path}")
+            if idx < len(matches):
+                time.sleep(delay)
+    except Exception:
+        cleanup_empty_dir(details_dir, stop_at=out_dir)
+        raise
 
     return manifest
 
@@ -283,126 +305,146 @@ def write_summary_meta(
 
 def cmd_teams(args: argparse.Namespace) -> None:
     out = make_output_dir(args.output_dir, prefix="opendota_teams")
-    teams, url = get_json("/teams", timeout=args.timeout, retries=args.retries)
-    if not isinstance(teams, list):
-        raise RuntimeError(f"Unexpected response for /teams: {type(teams)}")
+    try:
+        teams, url = get_json("/teams", timeout=args.timeout, retries=args.retries)
+        if not isinstance(teams, list):
+            raise RuntimeError(f"Unexpected response for /teams: {type(teams)}")
 
-    if args.name:
-        q = args.name.lower()
-        teams = [t for t in teams if q in str(t.get("name", "")).lower()]
+        if args.name:
+            q = args.name.lower()
+            teams = [t for t in teams if q in str(t.get("name", "")).lower()]
 
-    if args.limit:
-        teams = teams[: args.limit]
+        if args.limit:
+            teams = teams[: args.limit]
 
-    save_json(out / "teams.json", teams)
-    write_summary_meta(out, url, len(teams), "teams", args)
+        save_json(out / "teams.json", teams)
+        write_summary_meta(out, url, len(teams), "teams", args)
 
-    print(f"Saved {len(teams)} teams to: {out / 'teams.json'}")
-    if teams:
-        print("\nTop teams by filter:")
-        for t in teams[:10]:
-            print(f"- team_id={t.get('team_id')}  name={t.get('name')}")
+        print(f"Saved {len(teams)} teams to: {out / 'teams.json'}")
+        if teams:
+            print("\nTop teams by filter:")
+            for t in teams[:10]:
+                print(f"- team_id={t.get('team_id')}  name={t.get('name')}")
+    except Exception:
+        cleanup_empty_dir(out, stop_at=default_output_root())
+        raise
 
 
 def cmd_team_matches(args: argparse.Namespace) -> None:
     out = make_output_dir(args.output_dir, prefix=f"opendota_team_{args.team_id}_matches")
-    matches, url = get_json(f"/teams/{args.team_id}/matches", timeout=args.timeout, retries=args.retries)
-    if not isinstance(matches, list):
-        raise RuntimeError(f"Unexpected response for /teams/{{team_id}}/matches: {type(matches)}")
+    try:
+        matches, url = get_json(f"/teams/{args.team_id}/matches", timeout=args.timeout, retries=args.retries)
+        if not isinstance(matches, list):
+            raise RuntimeError(f"Unexpected response for /teams/{{team_id}}/matches: {type(matches)}")
 
-    filters = build_match_filters(args)
-    raw_count = len(matches)
-    matches = filter_team_matches(matches, filters)
-    matches = slice_matches(matches, args.limit)
+        filters = build_match_filters(args)
+        raw_count = len(matches)
+        matches = filter_team_matches(matches, filters)
+        matches = slice_matches(matches, args.limit)
 
-    save_json(out / f"team_{args.team_id}_matches.json", matches)
-    write_summary_meta(out, url, len(matches), "team-matches", args, filters=filters | {"raw_count": raw_count})
-    print(f"Saved {len(matches)} filtered team matches to: {out / f'team_{args.team_id}_matches.json'}")
+        save_json(out / f"team_{args.team_id}_matches.json", matches)
+        write_summary_meta(out, url, len(matches), "team-matches", args, filters=filters | {"raw_count": raw_count})
+        print(f"Saved {len(matches)} filtered team matches to: {out / f'team_{args.team_id}_matches.json'}")
 
-    if args.fetch_details:
-        manifest = fetch_match_details(
-            matches,
-            out,
-            delay=args.delay,
-            skip_existing=args.skip_existing,
-            timeout=args.timeout,
-            retries=args.retries,
-        )
-        save_json(out / "match_details_manifest.json", manifest)
+        if args.fetch_details:
+            manifest = fetch_match_details(
+                matches,
+                out,
+                delay=args.delay,
+                skip_existing=args.skip_existing,
+                timeout=args.timeout,
+                retries=args.retries,
+            )
+            save_json(out / "match_details_manifest.json", manifest)
+    except Exception:
+        cleanup_empty_dir(out, stop_at=default_output_root())
+        raise
 
 
 def cmd_team_dataset(args: argparse.Namespace) -> None:
     out = make_output_dir(args.output_dir, prefix=f"opendota_team_{args.team_id}_dataset")
-    matches, url = get_json(f"/teams/{args.team_id}/matches", timeout=args.timeout, retries=args.retries)
-    if not isinstance(matches, list):
-        raise RuntimeError(f"Unexpected response for /teams/{{team_id}}/matches: {type(matches)}")
+    try:
+        matches, url = get_json(f"/teams/{args.team_id}/matches", timeout=args.timeout, retries=args.retries)
+        if not isinstance(matches, list):
+            raise RuntimeError(f"Unexpected response for /teams/{{team_id}}/matches: {type(matches)}")
 
-    filters = build_match_filters(args)
-    raw_count = len(matches)
-    filtered_matches = filter_team_matches(matches, filters)
-    filtered_matches = slice_matches(filtered_matches, args.limit)
-    save_json(out / f"team_{args.team_id}_matches.json", filtered_matches)
+        filters = build_match_filters(args)
+        raw_count = len(matches)
+        filtered_matches = filter_team_matches(matches, filters)
+        filtered_matches = slice_matches(filtered_matches, args.limit)
+        save_json(out / f"team_{args.team_id}_matches.json", filtered_matches)
 
-    manifest = fetch_match_details(
-        filtered_matches,
-        out,
-        delay=args.delay,
-        skip_existing=args.skip_existing,
-        timeout=args.timeout,
-        retries=args.retries,
-    )
-    quality_report = [item["quality"] for item in manifest]
-
-    save_json(out / "match_details_manifest.json", manifest)
-    save_json(out / "match_quality_report.json", quality_report)
-    write_summary_meta(
-        out,
-        url,
-        len(filtered_matches),
-        "team-dataset",
-        args,
-        filters=filters | {"raw_count": raw_count},
-    )
-
-    print(f"Saved dataset with {len(filtered_matches)} matches to: {out}")
-    print(f"Match list: {out / f'team_{args.team_id}_matches.json'}")
-    print(f"Details manifest: {out / 'match_details_manifest.json'}")
-    print(f"Quality report: {out / 'match_quality_report.json'}")
-
-
-def cmd_pro_matches(args: argparse.Namespace) -> None:
-    out = make_output_dir(args.output_dir, prefix="opendota_pro_matches")
-    params = {}
-    if args.less_than_match_id is not None:
-        params["less_than_match_id"] = args.less_than_match_id
-
-    matches, url = get_json("/proMatches", params=params, timeout=args.timeout, retries=args.retries)
-    if not isinstance(matches, list):
-        raise RuntimeError(f"Unexpected response for /proMatches: {type(matches)}")
-
-    matches = slice_matches(matches, args.limit)
-    save_json(out / "pro_matches.json", matches)
-    write_summary_meta(out, url, len(matches), "pro-matches", args)
-    print(f"Saved {len(matches)} pro matches to: {out / 'pro_matches.json'}")
-
-    if args.fetch_details:
         manifest = fetch_match_details(
-            matches,
+            filtered_matches,
             out,
             delay=args.delay,
             skip_existing=args.skip_existing,
             timeout=args.timeout,
             retries=args.retries,
         )
+        quality_report = [item["quality"] for item in manifest]
+
         save_json(out / "match_details_manifest.json", manifest)
+        save_json(out / "match_quality_report.json", quality_report)
+        write_summary_meta(
+            out,
+            url,
+            len(filtered_matches),
+            "team-dataset",
+            args,
+            filters=filters | {"raw_count": raw_count},
+        )
+
+        print(f"Saved dataset with {len(filtered_matches)} matches to: {out}")
+        print(f"Match list: {out / f'team_{args.team_id}_matches.json'}")
+        print(f"Details manifest: {out / 'match_details_manifest.json'}")
+        print(f"Quality report: {out / 'match_quality_report.json'}")
+    except Exception:
+        cleanup_empty_dir(out, stop_at=default_output_root())
+        raise
+
+
+def cmd_pro_matches(args: argparse.Namespace) -> None:
+    out = make_output_dir(args.output_dir, prefix="opendota_pro_matches")
+    try:
+        params = {}
+        if args.less_than_match_id is not None:
+            params["less_than_match_id"] = args.less_than_match_id
+
+        matches, url = get_json("/proMatches", params=params, timeout=args.timeout, retries=args.retries)
+        if not isinstance(matches, list):
+            raise RuntimeError(f"Unexpected response for /proMatches: {type(matches)}")
+
+        matches = slice_matches(matches, args.limit)
+        save_json(out / "pro_matches.json", matches)
+        write_summary_meta(out, url, len(matches), "pro-matches", args)
+        print(f"Saved {len(matches)} pro matches to: {out / 'pro_matches.json'}")
+
+        if args.fetch_details:
+            manifest = fetch_match_details(
+                matches,
+                out,
+                delay=args.delay,
+                skip_existing=args.skip_existing,
+                timeout=args.timeout,
+                retries=args.retries,
+            )
+            save_json(out / "match_details_manifest.json", manifest)
+    except Exception:
+        cleanup_empty_dir(out, stop_at=default_output_root())
+        raise
 
 
 def cmd_match(args: argparse.Namespace) -> None:
     out = make_output_dir(args.output_dir, prefix=f"opendota_match_{args.match_id}")
-    match, url = get_json(f"/matches/{args.match_id}", timeout=args.timeout, retries=args.retries)
-    save_json(out / f"match_{args.match_id}.json", match)
-    write_summary_meta(out, url, 1, "match", args)
-    print(f"Saved match details to: {out / f'match_{args.match_id}.json'}")
+    try:
+        match, url = get_json(f"/matches/{args.match_id}", timeout=args.timeout, retries=args.retries)
+        save_json(out / f"match_{args.match_id}.json", match)
+        write_summary_meta(out, url, 1, "match", args)
+        print(f"Saved match details to: {out / f'match_{args.match_id}.json'}")
+    except Exception:
+        cleanup_empty_dir(out, stop_at=default_output_root())
+        raise
 
 
 def add_common_request_args(parser: argparse.ArgumentParser) -> None:
